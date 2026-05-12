@@ -74,6 +74,7 @@ class State:
     last_packet_total: int = 0
     learned_safe_mbps: int = 50
     current_mbps: int = 50
+    last_applied_mbps: int = 0
     freeze_active: bool = False
     bark_sent_for_freeze: bool = False
     freeze_reason: str = ""
@@ -470,7 +471,7 @@ def write_daily_report(config: Config, state: State, decision: Decision, log_dir
     path.write_text(content)
 
 
-def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run: bool = False) -> None:
+def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run: bool = False, log_dir: Path = DEFAULT_LOG_DIR) -> None:
     config = Config.load(config_path)
     if config.iface == "auto":
         config.iface = default_iface()
@@ -478,7 +479,7 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
     state = State.load(state_path)
     engine = PolicyEngine(config)
     notifier = BarkNotifier(config.bark_url)
-    metrics = MetricsAggregator(DEFAULT_LOG_DIR)
+    metrics = MetricsAggregator(log_dir)
     baseline_sample = True
 
     while True:
@@ -509,7 +510,11 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         state.last_packet_total = packets
 
         decision = engine.decide(state, drop_score)
-        apply_tc(config, decision.target_mbps, dry_run=dry_run)
+        applied_tc = False
+        if state.last_applied_mbps != decision.target_mbps:
+            apply_tc(config, decision.target_mbps, dry_run=dry_run)
+            state.last_applied_mbps = decision.target_mbps
+            applied_tc = True
         if decision.notify_bark:
             try:
                 notifier.send_freeze_alert(config.iface, decision.target_mbps, decision.reason)
@@ -520,10 +525,12 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         metrics.record(config, state, now, tx_delta, rx_delta, packet_delta, drop_delta, retrans_delta, decision)
         if once:
             metrics.flush()
-        write_daily_report(config, state, decision)
+        write_daily_report(config, state, decision, log_dir)
         log_line(
             f"iface={config.iface} target={decision.target_mbps}Mbps tx_gb={state.tx_bytes_today / GB:.2f} "
-            f"rx_gb={state.rx_bytes_today / GB:.2f} drop_score={drop_score:.2f} freeze={state.freeze_active} reason={decision.reason}"
+            f"rx_gb={state.rx_bytes_today / GB:.2f} drop_score={drop_score:.2f} freeze={state.freeze_active} "
+            f"applied_tc={applied_tc} reason={decision.reason}",
+            log_dir,
         )
 
         if once:
@@ -588,6 +595,7 @@ def thaw(config_path: Path, state_path: Path) -> None:
     st.consecutive_loss_windows = 0
     st.current_mbps = min(cfg.max_mbps, max(cfg.min_dynamic_mbps, st.learned_safe_mbps))
     apply_tc(cfg, st.current_mbps)
+    st.last_applied_mbps = st.current_mbps
     st.save(state_path)
 
 

@@ -15,6 +15,7 @@ from openx_netguard.netguard import (  # noqa: E402
     State,
     TcPlanner,
     apply_tc,
+    daemon_loop,
 )
 
 
@@ -161,6 +162,23 @@ def test_apply_tc_dry_run_does_not_execute_commands(monkeypatch, capsys):
     apply_tc(cfg, 9, dry_run=True)
 
     assert "tc qdisc replace dev eth0 root" in capsys.readouterr().out
+
+
+def test_daemon_loop_applies_tc_only_when_limit_changes(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    Config(iface="eth0", sample_interval_seconds=0).save(cfg_path)
+    State(day="2026-05-13", last_applied_mbps=50).save(state_path)
+    applied = []
+
+    monkeypatch.setattr("openx_netguard.netguard.read_net_counters", lambda iface: (100, 100, 0))
+    monkeypatch.setattr("openx_netguard.netguard.read_packet_counters", lambda iface: 10)
+    monkeypatch.setattr("openx_netguard.netguard.read_tcp_retrans", lambda: 0)
+    monkeypatch.setattr("openx_netguard.netguard.apply_tc", lambda cfg, mbps, dry_run=False: applied.append(mbps))
+
+    daemon_loop(cfg_path, state_path, once=True, log_dir=tmp_path)
+
+    assert applied == []
 
 
 def test_metrics_aggregator_writes_five_minute_jsonl(tmp_path):
