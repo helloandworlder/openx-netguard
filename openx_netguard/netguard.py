@@ -42,6 +42,7 @@ class Config:
     loss_backoff_factor: float = 0.7
     recovery_step_mbps: int = 2
     severe_drop_score: float = 8.0
+    severe_loss_windows: int = 3
     bark_url: str = ""
     auto_thaw_daily: bool = True
     daily_report: bool = True
@@ -73,6 +74,7 @@ class State:
     freeze_active: bool = False
     bark_sent_for_freeze: bool = False
     freeze_reason: str = ""
+    consecutive_loss_windows: int = 0
     updated_at: str = ""
 
     @classmethod
@@ -114,6 +116,7 @@ class PolicyEngine:
             state.last_drop_total = 0
             state.last_tcp_retrans = 0
             state.last_packet_total = 0
+            state.consecutive_loss_windows = 0
 
     def decide(self, state: State, drop_score: float, now: datetime | None = None) -> Decision:
         self.ensure_day(state, now)
@@ -123,12 +126,17 @@ class PolicyEngine:
         notify = False
         reason = "normal"
 
+        if drop_score >= self.config.severe_drop_score:
+            state.consecutive_loss_windows += 1
+        else:
+            state.consecutive_loss_windows = 0
+
         if state.tx_bytes_today >= quota_bytes:
             state.freeze_active = True
             state.freeze_reason = "daily quota reached"
-        elif drop_score >= self.config.severe_drop_score:
+        elif state.consecutive_loss_windows >= self.config.severe_loss_windows:
             state.freeze_active = True
-            state.freeze_reason = f"severe packet loss score {drop_score:.2f}"
+            state.freeze_reason = f"severe packet loss score {drop_score:.2f} for {state.consecutive_loss_windows} windows"
 
         if state.freeze_active:
             target = self.config.freeze_mbps
@@ -396,6 +404,7 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
     engine = PolicyEngine(config)
     notifier = BarkNotifier(config.bark_url)
     metrics = MetricsAggregator(DEFAULT_LOG_DIR)
+    baseline_sample = True
 
     while True:
         now = datetime.now(timezone.utc)
@@ -404,7 +413,8 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         tcp_retrans = read_tcp_retrans()
         engine.ensure_day(state)
 
-        first_sample = state.last_tx_bytes == 0 or state.last_rx_bytes == 0
+        first_sample = baseline_sample or state.last_tx_bytes == 0 or state.last_rx_bytes == 0
+        baseline_sample = False
         tx_delta = 0
         rx_delta = 0
         if not first_sample:
@@ -495,6 +505,12 @@ def thaw(config_path: Path, state_path: Path) -> None:
     st.freeze_active = False
     st.freeze_reason = ""
     st.bark_sent_for_freeze = False
+    st.last_tx_bytes = 0
+    st.last_rx_bytes = 0
+    st.last_drop_total = 0
+    st.last_tcp_retrans = 0
+    st.last_packet_total = 0
+    st.consecutive_loss_windows = 0
     st.current_mbps = min(cfg.max_mbps, max(cfg.min_dynamic_mbps, st.learned_safe_mbps))
     apply_tc(cfg, st.current_mbps)
     st.save(state_path)

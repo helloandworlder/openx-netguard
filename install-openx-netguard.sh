@@ -48,6 +48,7 @@ if [ ! -f "$CONFIG_DIR/config.json" ]; then
   "loss_backoff_factor": 0.7,
   "recovery_step_mbps": 2,
   "severe_drop_score": 8.0,
+  "severe_loss_windows": 3,
   "bark_url": "",
   "auto_thaw_daily": true,
   "daily_report": true

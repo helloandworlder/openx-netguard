@@ -45,6 +45,20 @@ def test_policy_freezes_at_daily_quota_and_requests_bark_once():
     assert second.notify_bark is False
 
 
+def test_severe_loss_must_persist_before_freeze():
+    cfg = Config(severe_drop_score=8.0, severe_loss_windows=3)
+    state = State(day="2026-05-13", learned_safe_mbps=50)
+    engine = PolicyEngine(cfg)
+
+    first = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+    second = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, 1, tzinfo=timezone.utc))
+    third = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, 2, tzinfo=timezone.utc))
+
+    assert first.freeze_active is False
+    assert second.freeze_active is False
+    assert third.freeze_active is True
+
+
 def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
     cfg = Config(max_mbps=50, min_dynamic_mbps=8, loss_backoff_factor=0.7, recovery_step_mbps=2)
     state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=1 * 1024**3)
