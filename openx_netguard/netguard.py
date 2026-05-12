@@ -253,12 +253,14 @@ class TcPlanner:
             ["modprobe", "ifb"],
             ["ip", "link", "add", ifb, "type", "ifb"],
             ["ip", "link", "set", "dev", ifb, "up"],
-            ["tc", "qdisc", "del", "dev", iface, "root"],
             ["tc", "qdisc", "del", "dev", iface, "ingress"],
             ["tc", "qdisc", "del", "dev", ifb, "root"],
-            ["tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "10"],
-            ["tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:10", "htb", "rate", rate, "ceil", rate],
-            ["tc", "qdisc", "replace", "dev", iface, "parent", "1:10", "handle", "10:", "fq_codel"],
+            ["tc", "qdisc", "replace", "dev", iface, "parent", ":1", "handle", "101:", "htb", "default", "10"],
+            ["tc", "class", "replace", "dev", iface, "parent", "101:", "classid", "101:10", "htb", "rate", rate, "ceil", rate],
+            ["tc", "qdisc", "replace", "dev", iface, "parent", "101:10", "handle", "110:", "fq_codel"],
+            ["tc", "qdisc", "replace", "dev", iface, "parent", ":2", "handle", "102:", "htb", "default", "10"],
+            ["tc", "class", "replace", "dev", iface, "parent", "102:", "classid", "102:10", "htb", "rate", rate, "ceil", rate],
+            ["tc", "qdisc", "replace", "dev", iface, "parent", "102:10", "handle", "120:", "fq_codel"],
             ["tc", "qdisc", "replace", "dev", iface, "ingress"],
             ["tc", "filter", "replace", "dev", iface, "parent", "ffff:", "protocol", "all", "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifb],
             ["tc", "qdisc", "replace", "dev", ifb, "root", "handle", "1:", "htb", "default", "10"],
@@ -268,7 +270,8 @@ class TcPlanner:
 
     def plan_clear(self) -> list[list[str]]:
         return [
-            ["tc", "qdisc", "del", "dev", self.config.iface, "root"],
+            ["tc", "qdisc", "del", "dev", self.config.iface, "parent", ":1"],
+            ["tc", "qdisc", "del", "dev", self.config.iface, "parent", ":2"],
             ["tc", "qdisc", "del", "dev", self.config.iface, "ingress"],
             ["tc", "qdisc", "del", "dev", self.config.ifb_iface, "root"],
         ]

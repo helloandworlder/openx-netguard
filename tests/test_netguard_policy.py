@@ -117,8 +117,8 @@ def test_tc_planner_builds_egress_and_ingress_commands():
     joined = "\n".join(" ".join(cmd) for cmd in commands)
 
     assert "modprobe ifb" in joined
-    assert "tc qdisc del dev eth0 root" in joined
-    assert "tc qdisc replace dev eth0 root handle 1: htb default 10" in joined
+    assert "tc qdisc replace dev eth0 parent :1 handle 101: htb default 10" in joined
+    assert "tc qdisc replace dev eth0 parent :2 handle 102: htb default 10" in joined
     assert "tc filter replace dev eth0 parent ffff:" in joined
     assert "tc qdisc replace dev ifb0 root handle 1: htb default 10" in joined
     assert "rate 12mbit ceil 12mbit" in joined
@@ -166,7 +166,7 @@ def test_apply_tc_dry_run_does_not_execute_commands(monkeypatch, capsys):
 
     apply_tc(cfg, 9, dry_run=True)
 
-    assert "tc qdisc replace dev eth0 root" in capsys.readouterr().out
+    assert "tc qdisc replace dev eth0 parent :1 handle 101:" in capsys.readouterr().out
 
 
 def test_daemon_loop_applies_tc_only_when_limit_changes(monkeypatch, tmp_path):
