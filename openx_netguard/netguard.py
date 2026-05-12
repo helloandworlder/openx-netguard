@@ -44,6 +44,7 @@ class Config:
     severe_drop_score: float = 8.0
     severe_loss_windows: int = 3
     budget_curve_weights: list[float] | None = None
+    budget_curve_bucket_minutes: int = 10
     budget_overshoot_factor: float = 0.85
     budget_recovery_factor: float = 1.08
     bark_url: str = ""
@@ -236,8 +237,11 @@ class PolicyEngine:
             0.75,
         ]
         total = sum(weights)
+        bucket_minutes = max(1, min(60, self.config.budget_curve_bucket_minutes))
+        bucket_start_minute = (bj.minute // bucket_minutes) * bucket_minutes
+        bucket_midpoint = min(59, bucket_start_minute + bucket_minutes / 2)
         completed = sum(weights[: bj.hour])
-        current = weights[bj.hour] * ((bj.minute * 60 + bj.second) / 3600)
+        current = weights[bj.hour] * ((bucket_midpoint * 60) / 3600)
         return max(0.001, min(1.0, (completed + current) / total))
 
 

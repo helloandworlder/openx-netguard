@@ -109,6 +109,21 @@ def test_budget_curve_has_low_expected_usage_between_2_and_8_beijing_time():
     assert "budget-curve" in night_decision.reason
 
 
+def test_budget_curve_uses_ten_minute_buckets_with_five_minute_tolerance():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90, budget_curve_bucket_minutes=10)
+    engine = PolicyEngine(cfg)
+    early = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=3 * 1024**3)
+    same_bucket = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=3 * 1024**3)
+    next_bucket = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=3 * 1024**3)
+
+    early_decision = engine.decide(early, drop_score=0.0, now=datetime(2026, 5, 13, 1, 2, tzinfo=timezone.utc))
+    same_bucket_decision = engine.decide(same_bucket, drop_score=0.0, now=datetime(2026, 5, 13, 1, 8, tzinfo=timezone.utc))
+    next_bucket_decision = engine.decide(next_bucket, drop_score=0.0, now=datetime(2026, 5, 13, 1, 12, tzinfo=timezone.utc))
+
+    assert early_decision.target_mbps == same_bucket_decision.target_mbps
+    assert next_bucket_decision.target_mbps >= same_bucket_decision.target_mbps
+
+
 def test_tc_planner_builds_egress_and_ingress_commands():
     cfg = Config(iface="eth0", max_mbps=50)
     planner = TcPlanner(cfg)

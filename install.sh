@@ -59,6 +59,7 @@ write_default_config() {
   "severe_drop_score": 8.0,
   "severe_loss_windows": 3,
   "budget_curve_weights": null,
+  "budget_curve_bucket_minutes": 10,
   "budget_overshoot_factor": 0.85,
   "budget_recovery_factor": 1.08,
   "bark_url": "",
