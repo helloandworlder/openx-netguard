@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenX NetGuard active bandwidth and packet-loss controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openx-netguard daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
