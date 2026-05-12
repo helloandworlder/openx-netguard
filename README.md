@@ -38,6 +38,7 @@ journalctl -u openx-netguard -f
 - 每日北京时间出向目标：`90GB`
 - 提前保护线：`88GB`
 - 保护态出入口带宽：`4Mbps`
+- 智能预算曲线：按北京时间小时权重分配全天流量，`02:00-08:00` 权重最低，白天和晚间权重更高
 - 每日报告：`/var/log/openx-netguard/daily-YYYY-MM-DD.md`
 - 5 分钟聚合指标：`/var/log/openx-netguard/metrics-YYYY-MM-DD.jsonl`
 
@@ -50,6 +51,6 @@ journalctl -u openx-netguard -f
 - 平均速度：`avg_tx_mbps`、`avg_rx_mbps`
 - 丢包/重传：`drop_delta`、`tcp_retrans_delta`、`packet_loss_rate`
 - 当前行为：`behavior`、`freeze_active`、`target_mbps_avg`
-- 学习参数：`learned_safe_mbps`
+- 学习参数：`learned_safe_mbps`、`budget_pressure_ewma`
 
 这套策略只能尽量平滑流量和降低触发平台侧惩罚的概率，不能保证规避腾讯云未公开的限速规则。

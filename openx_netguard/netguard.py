@@ -43,6 +43,9 @@ class Config:
     recovery_step_mbps: int = 2
     severe_drop_score: float = 8.0
     severe_loss_windows: int = 3
+    budget_curve_weights: list[float] | None = None
+    budget_overshoot_factor: float = 0.85
+    budget_recovery_factor: float = 1.08
     bark_url: str = ""
     auto_thaw_daily: bool = True
     daily_report: bool = True
@@ -75,6 +78,7 @@ class State:
     bark_sent_for_freeze: bool = False
     freeze_reason: str = ""
     consecutive_loss_windows: int = 0
+    budget_pressure_ewma: float = 0.0
     updated_at: str = ""
 
     @classmethod
@@ -111,6 +115,7 @@ class PolicyEngine:
             state.freeze_active = False
             state.bark_sent_for_freeze = False
             state.freeze_reason = ""
+            state.budget_pressure_ewma = 0.0
             state.last_tx_bytes = 0
             state.last_rx_bytes = 0
             state.last_drop_total = 0
@@ -145,27 +150,94 @@ class PolicyEngine:
                 notify = True
                 state.bark_sent_for_freeze = True
         else:
-            target = self._dynamic_target_mbps(state, drop_score, soft_bytes, quota_bytes)
-            reason = "dynamic"
+            target, reason = self._dynamic_target_mbps(state, drop_score, soft_bytes, quota_bytes, now)
 
         state.current_mbps = int(target)
         state.updated_at = datetime.now(timezone.utc).isoformat()
         return Decision(int(target), state.freeze_active, notify, reason)
 
-    def _dynamic_target_mbps(self, state: State, drop_score: float, soft_bytes: int, quota_bytes: int) -> int:
+    def _dynamic_target_mbps(
+        self,
+        state: State,
+        drop_score: float,
+        soft_bytes: int,
+        quota_bytes: int,
+        now: datetime | None,
+    ) -> tuple[int, str]:
         safe = state.learned_safe_mbps or self.config.max_mbps
+        reason = "dynamic"
         if drop_score > 0:
             safe = max(self.config.min_dynamic_mbps, int(safe * self.config.loss_backoff_factor))
+            reason = "loss-backoff"
         else:
             safe = min(self.config.max_mbps, safe + self.config.recovery_step_mbps)
+
+        curve_target = self._budget_curve_target_mbps(state, quota_bytes, now)
+        if curve_target < safe:
+            pressure = 1.0 - (curve_target / max(1, safe))
+            state.budget_pressure_ewma = round((state.budget_pressure_ewma * 0.7) + (pressure * 0.3), 6)
+            safe = max(self.config.min_dynamic_mbps, min(safe, curve_target))
+            reason = f"budget-curve pressure={state.budget_pressure_ewma:.3f}"
+        else:
+            state.budget_pressure_ewma = round(state.budget_pressure_ewma * 0.85, 6)
 
         if state.tx_bytes_today >= soft_bytes:
             remaining_ratio = max(0.05, (quota_bytes - state.tx_bytes_today) / max(1, quota_bytes - soft_bytes))
             safe = min(safe, max(self.config.freeze_mbps, int(self.config.max_mbps * remaining_ratio)))
+            reason = "soft-quota"
 
         safe = max(self.config.min_dynamic_mbps, min(self.config.max_mbps, int(safe)))
         state.learned_safe_mbps = safe
-        return safe
+        return safe, reason
+
+    def _budget_curve_target_mbps(self, state: State, quota_bytes: int, now: datetime | None) -> int:
+        now = now or datetime.now(timezone.utc)
+        bj = now.astimezone(BEIJING_TZ)
+        progress = self._weighted_progress(bj)
+        expected_bytes = quota_bytes * progress
+        if expected_bytes <= 0:
+            expected_bytes = quota_bytes * 0.005
+
+        ratio = state.tx_bytes_today / expected_bytes
+        if ratio <= 1.05:
+            return self.config.max_mbps
+
+        target = self.config.max_mbps * (self.config.budget_overshoot_factor / ratio)
+        if ratio >= 2.5:
+            target *= 0.5
+        return max(self.config.min_dynamic_mbps, int(target))
+
+    def _weighted_progress(self, bj: datetime) -> float:
+        weights = self.config.budget_curve_weights or [
+            0.55,
+            0.45,
+            0.18,
+            0.12,
+            0.10,
+            0.10,
+            0.15,
+            0.30,
+            0.75,
+            1.00,
+            1.15,
+            1.20,
+            1.20,
+            1.15,
+            1.10,
+            1.10,
+            1.15,
+            1.25,
+            1.35,
+            1.40,
+            1.35,
+            1.20,
+            0.95,
+            0.75,
+        ]
+        total = sum(weights)
+        completed = sum(weights[: bj.hour])
+        current = weights[bj.hour] * ((bj.minute * 60 + bj.second) / 3600)
+        return max(0.001, min(1.0, (completed + current) / total))
 
 
 class TcPlanner:
@@ -239,6 +311,7 @@ class MetricsAggregator:
                 "freeze_active": False,
                 "behavior": decision.reason,
                 "learned_safe_mbps": state.learned_safe_mbps,
+                "budget_pressure_ewma": state.budget_pressure_ewma,
             }
 
         self.current["tx_bytes"] += tx_delta
@@ -251,6 +324,7 @@ class MetricsAggregator:
         self.current["freeze_active"] = self.current["freeze_active"] or decision.freeze_active
         self.current["behavior"] = decision.reason
         self.current["learned_safe_mbps"] = state.learned_safe_mbps
+        self.current["budget_pressure_ewma"] = state.budget_pressure_ewma
 
     def flush(self) -> None:
         if not self.current:
@@ -385,6 +459,7 @@ def write_daily_report(config: Config, state: State, decision: Decision, log_dir
             f"- RX today: `{state.rx_bytes_today / GB:.2f} GB`",
             f"- Current limit: `{decision.target_mbps} Mbps`",
             f"- Learned safe limit: `{state.learned_safe_mbps} Mbps`",
+            f"- Budget pressure EWMA: `{state.budget_pressure_ewma}`",
             f"- Freeze active: `{state.freeze_active}`",
             f"- Reason: `{decision.reason}`",
             f"- Bark sent for freeze: `{state.bark_sent_for_freeze}`",

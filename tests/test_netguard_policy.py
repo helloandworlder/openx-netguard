@@ -71,6 +71,42 @@ def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
     assert stable_decision.target_mbps == 37
 
 
+def test_budget_curve_prevents_burning_daily_quota_in_first_hour():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90)
+    state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=20 * 1024**3)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 12, 17, 0, tzinfo=timezone.utc))
+
+    assert decision.freeze_active is False
+    assert decision.target_mbps <= 8
+    assert "budget-curve" in decision.reason
+
+
+def test_budget_curve_allows_catchup_when_under_budget_late_day():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90)
+    state = State(day="2026-05-13", learned_safe_mbps=20, tx_bytes_today=20 * 1024**3)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 12, 0, tzinfo=timezone.utc))
+
+    assert decision.target_mbps >= 20
+    assert decision.freeze_active is False
+
+
+def test_budget_curve_has_low_expected_usage_between_2_and_8_beijing_time():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90)
+    engine = PolicyEngine(cfg)
+    night = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=10 * 1024**3)
+    morning = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=10 * 1024**3)
+
+    night_decision = engine.decide(night, drop_score=0.0, now=datetime(2026, 5, 12, 19, 0, tzinfo=timezone.utc))
+    morning_decision = engine.decide(morning, drop_score=0.0, now=datetime(2026, 5, 13, 2, 0, tzinfo=timezone.utc))
+
+    assert night_decision.target_mbps < morning_decision.target_mbps
+    assert "budget-curve" in night_decision.reason
+
+
 def test_tc_planner_builds_egress_and_ingress_commands():
     cfg = Config(iface="eth0", max_mbps=50)
     planner = TcPlanner(cfg)
