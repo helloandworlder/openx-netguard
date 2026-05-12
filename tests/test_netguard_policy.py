@@ -65,6 +65,7 @@ def test_tc_planner_builds_egress_and_ingress_commands():
     joined = "\n".join(" ".join(cmd) for cmd in commands)
 
     assert "modprobe ifb" in joined
+    assert "tc qdisc del dev eth0 root" in joined
     assert "tc qdisc replace dev eth0 root handle 1: htb default 10" in joined
     assert "tc filter replace dev eth0 parent ffff:" in joined
     assert "tc qdisc replace dev ifb0 root handle 1: htb default 10" in joined

@@ -172,6 +172,9 @@ class TcPlanner:
             ["modprobe", "ifb"],
             ["ip", "link", "add", ifb, "type", "ifb"],
             ["ip", "link", "set", "dev", ifb, "up"],
+            ["tc", "qdisc", "del", "dev", iface, "root"],
+            ["tc", "qdisc", "del", "dev", iface, "ingress"],
+            ["tc", "qdisc", "del", "dev", ifb, "root"],
             ["tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "10"],
             ["tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:10", "htb", "rate", rate, "ceil", rate],
             ["tc", "qdisc", "replace", "dev", iface, "parent", "1:10", "handle", "10:", "fq_codel"],
@@ -349,7 +352,7 @@ def apply_tc(config: Config, mbps: int, dry_run: bool = False) -> None:
 
 
 def _acceptable_tc_error(stderr: str) -> bool:
-    allowed = ("File exists", "Cannot find device", "Exclusivity flag on")
+    allowed = ("File exists", "Cannot find device", "Exclusivity flag on", "No such file", "Invalid argument")
     return any(text in stderr for text in allowed)
 
 
