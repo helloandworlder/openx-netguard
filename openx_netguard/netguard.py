@@ -401,16 +401,17 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         tcp_retrans = read_tcp_retrans()
         engine.ensure_day(state)
 
+        first_sample = state.last_tx_bytes == 0 or state.last_rx_bytes == 0
         tx_delta = 0
         rx_delta = 0
-        if state.last_tx_bytes:
+        if not first_sample:
             tx_delta = max(0, tx - state.last_tx_bytes)
             rx_delta = max(0, rx - state.last_rx_bytes)
             state.tx_bytes_today += tx_delta
             state.rx_bytes_today += rx_delta
-        drop_delta = max(0, drops - state.last_drop_total)
-        retrans_delta = max(0, tcp_retrans - state.last_tcp_retrans)
-        packet_delta = max(0, packets - state.last_packet_total)
+        drop_delta = 0 if first_sample else max(0, drops - state.last_drop_total)
+        retrans_delta = 0 if first_sample else max(0, tcp_retrans - state.last_tcp_retrans)
+        packet_delta = 0 if first_sample else max(0, packets - state.last_packet_total)
         drop_score = drop_delta + min(20, retrans_delta / 10)
 
         state.last_tx_bytes = tx
