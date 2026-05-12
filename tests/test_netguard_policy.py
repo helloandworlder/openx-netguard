@@ -141,6 +141,7 @@ def test_tc_planner_builds_egress_and_ingress_commands():
 
 def test_tc_delete_default_mq_error_is_acceptable():
     assert _acceptable_tc_error("Error: Cannot delete qdisc with handle of zero.")
+    assert _acceptable_tc_error("Error: Invalid handle.")
 
 
 def test_bark_notifier_posts_title_and_body(tmp_path):

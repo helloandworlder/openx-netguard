@@ -448,6 +448,7 @@ def _acceptable_tc_error(stderr: str) -> bool:
         "Exclusivity flag on",
         "No such file",
         "Invalid argument",
+        "Invalid handle",
         "Cannot delete qdisc with handle of zero",
     )
     return any(text in stderr for text in allowed)
