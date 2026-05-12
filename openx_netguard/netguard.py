@@ -435,7 +435,14 @@ def apply_tc(config: Config, mbps: int, dry_run: bool = False) -> None:
 
 
 def _acceptable_tc_error(stderr: str) -> bool:
-    allowed = ("File exists", "Cannot find device", "Exclusivity flag on", "No such file", "Invalid argument")
+    allowed = (
+        "File exists",
+        "Cannot find device",
+        "Exclusivity flag on",
+        "No such file",
+        "Invalid argument",
+        "Cannot delete qdisc with handle of zero",
+    )
     return any(text in stderr for text in allowed)
 
 

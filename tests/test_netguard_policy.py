@@ -14,6 +14,7 @@ from openx_netguard.netguard import (  # noqa: E402
     PolicyEngine,
     State,
     TcPlanner,
+    _acceptable_tc_error,
     apply_tc,
     daemon_loop,
 )
@@ -121,6 +122,10 @@ def test_tc_planner_builds_egress_and_ingress_commands():
     assert "tc filter replace dev eth0 parent ffff:" in joined
     assert "tc qdisc replace dev ifb0 root handle 1: htb default 10" in joined
     assert "rate 12mbit ceil 12mbit" in joined
+
+
+def test_tc_delete_default_mq_error_is_acceptable():
+    assert _acceptable_tc_error("Error: Cannot delete qdisc with handle of zero.")
 
 
 def test_bark_notifier_posts_title_and_body(tmp_path):
