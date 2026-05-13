@@ -32,6 +32,7 @@ DEFAULT_LOG_DIR = Path("/var/log/openx-netguard")
 class Config:
     iface: str = "auto"
     ifb_iface: str = "ifb0"
+    egress_ifb_iface: str = "ifb1"
     daily_tx_quota_gb: int = 90
     soft_quota_gb: int = 88
     max_mbps: int = 50
@@ -251,33 +252,30 @@ class TcPlanner:
 
     def plan_apply(self, mbps: int) -> list[list[str]]:
         iface = self.config.iface
-        ifb = self.config.ifb_iface
+        ingress_ifb = self.config.ifb_iface
+        egress_ifb = self.config.egress_ifb_iface
         rate = f"{int(mbps)}mbit"
         return [
             ["modprobe", "ifb"],
-            ["ip", "link", "add", ifb, "type", "ifb"],
-            ["ip", "link", "set", "dev", ifb, "up"],
-            ["tc", "qdisc", "del", "dev", iface, "ingress"],
-            ["tc", "qdisc", "del", "dev", ifb, "root"],
-            ["tc", "qdisc", "replace", "dev", iface, "parent", ":1", "handle", "101:", "htb", "default", "10"],
-            ["tc", "class", "replace", "dev", iface, "parent", "101:", "classid", "101:10", "htb", "rate", rate, "ceil", rate],
-            ["tc", "qdisc", "replace", "dev", iface, "parent", "101:10", "handle", "110:", "fq_codel"],
-            ["tc", "qdisc", "replace", "dev", iface, "parent", ":2", "handle", "102:", "htb", "default", "10"],
-            ["tc", "class", "replace", "dev", iface, "parent", "102:", "classid", "102:10", "htb", "rate", rate, "ceil", rate],
-            ["tc", "qdisc", "replace", "dev", iface, "parent", "102:10", "handle", "120:", "fq_codel"],
-            ["tc", "qdisc", "replace", "dev", iface, "ingress"],
-            ["tc", "filter", "replace", "dev", iface, "parent", "ffff:", "protocol", "all", "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifb],
-            ["tc", "qdisc", "replace", "dev", ifb, "root", "handle", "1:", "htb", "default", "10"],
-            ["tc", "class", "replace", "dev", ifb, "parent", "1:", "classid", "1:10", "htb", "rate", rate, "ceil", rate],
-            ["tc", "qdisc", "replace", "dev", ifb, "parent", "1:10", "handle", "10:", "fq_codel"],
+            ["ip", "link", "add", ingress_ifb, "type", "ifb"],
+            ["ip", "link", "add", egress_ifb, "type", "ifb"],
+            ["ip", "link", "set", "dev", ingress_ifb, "up"],
+            ["ip", "link", "set", "dev", egress_ifb, "up"],
+            ["tc", "qdisc", "del", "dev", iface, "clsact"],
+            ["tc", "qdisc", "del", "dev", ingress_ifb, "root"],
+            ["tc", "qdisc", "del", "dev", egress_ifb, "root"],
+            ["tc", "qdisc", "replace", "dev", iface, "clsact"],
+            ["tc", "filter", "add", "dev", iface, "ingress", "matchall", "action", "mirred", "egress", "redirect", "dev", ingress_ifb],
+            ["tc", "filter", "add", "dev", iface, "egress", "matchall", "action", "mirred", "egress", "redirect", "dev", egress_ifb],
+            ["tc", "qdisc", "replace", "dev", ingress_ifb, "root", "cake", "bandwidth", rate, "ingress"],
+            ["tc", "qdisc", "replace", "dev", egress_ifb, "root", "cake", "bandwidth", rate],
         ]
 
     def plan_clear(self) -> list[list[str]]:
         return [
-            ["tc", "qdisc", "del", "dev", self.config.iface, "parent", ":1"],
-            ["tc", "qdisc", "del", "dev", self.config.iface, "parent", ":2"],
-            ["tc", "qdisc", "del", "dev", self.config.iface, "ingress"],
+            ["tc", "qdisc", "del", "dev", self.config.iface, "clsact"],
             ["tc", "qdisc", "del", "dev", self.config.ifb_iface, "root"],
+            ["tc", "qdisc", "del", "dev", self.config.egress_ifb_iface, "root"],
         ]
 
 

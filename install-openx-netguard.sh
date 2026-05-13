@@ -38,6 +38,7 @@ if [ ! -f "$CONFIG_DIR/config.json" ]; then
 {
   "iface": "$IFACE",
   "ifb_iface": "ifb0",
+  "egress_ifb_iface": "ifb1",
   "daily_tx_quota_gb": 90,
   "soft_quota_gb": 88,
   "max_mbps": 50,
