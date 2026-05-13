@@ -38,6 +38,11 @@ class Config:
     max_mbps: int = 50
     freeze_mbps: int = 4
     min_dynamic_mbps: int = 8
+    baseline_mbps: int = 8
+    boost_levels: list[int] | None = None
+    boost_success_required_windows: int = 3
+    risk_score_backoff_threshold: float = 3.0
+    risk_score_freeze_threshold: float = 8.0
     sample_interval_seconds: int = 30
     metric_interval_seconds: int = 300
     loss_backoff_factor: float = 0.7
@@ -74,14 +79,19 @@ class State:
     last_drop_total: int = 0
     last_tcp_retrans: int = 0
     last_packet_total: int = 0
-    learned_safe_mbps: int = 50
-    current_mbps: int = 50
+    learned_safe_mbps: int = 8
+    learned_ceiling_mbps: int = 8
+    current_mbps: int = 8
     last_applied_mbps: int = 0
     freeze_active: bool = False
     bark_sent_for_freeze: bool = False
     freeze_reason: str = ""
     consecutive_loss_windows: int = 0
     budget_pressure_ewma: float = 0.0
+    risk_score_ewma: float = 0.0
+    baseline_health_ewma: float = 1.0
+    boost_success_windows: int = 0
+    boost_fail_windows: int = 0
     updated_at: str = ""
 
     @classmethod
@@ -119,6 +129,10 @@ class PolicyEngine:
             state.bark_sent_for_freeze = False
             state.freeze_reason = ""
             state.budget_pressure_ewma = 0.0
+            state.risk_score_ewma = 0.0
+            state.baseline_health_ewma = 1.0
+            state.boost_success_windows = 0
+            state.boost_fail_windows = 0
             state.last_tx_bytes = 0
             state.last_rx_bytes = 0
             state.last_drop_total = 0
@@ -134,6 +148,7 @@ class PolicyEngine:
         notify = False
         reason = "normal"
 
+        state.risk_score_ewma = round((state.risk_score_ewma * 0.7) + (drop_score * 0.3), 6)
         if drop_score >= self.config.severe_drop_score:
             state.consecutive_loss_windows += 1
         else:
@@ -167,20 +182,38 @@ class PolicyEngine:
         quota_bytes: int,
         now: datetime | None,
     ) -> tuple[int, str]:
-        safe = state.learned_safe_mbps or self.config.max_mbps
+        baseline = self._baseline_mbps()
+        levels = self._boost_levels()
+        safe = state.learned_safe_mbps or baseline
         reason = "dynamic"
-        if drop_score > 0:
-            safe = max(self.config.min_dynamic_mbps, int(safe * self.config.loss_backoff_factor))
-            reason = "loss-backoff"
+
+        if drop_score >= self.config.risk_score_backoff_threshold:
+            state.boost_fail_windows += 1
+            state.boost_success_windows = 0
+            state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.0, 6)
+            state.learned_ceiling_mbps = max(baseline, self._previous_level(safe, levels))
+            safe = baseline
+            reason = "baseline-risk-backoff"
         else:
-            safe = min(self.config.max_mbps, safe + self.config.recovery_step_mbps)
+            state.boost_success_windows += 1
+            state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.2, 6)
+            if safe < self.config.max_mbps and state.boost_success_windows >= self.config.boost_success_required_windows:
+                safe = self._next_level(safe, levels)
+                state.learned_ceiling_mbps = max(state.learned_ceiling_mbps, safe)
+                state.boost_success_windows = 0
+                reason = "boost-step-up"
+            else:
+                safe = max(baseline, min(safe, state.learned_ceiling_mbps or self.config.max_mbps))
 
         curve_target = self._budget_curve_target_mbps(state, quota_bytes, now)
         if curve_target < safe:
             pressure = 1.0 - (curve_target / max(1, safe))
             state.budget_pressure_ewma = round((state.budget_pressure_ewma * 0.7) + (pressure * 0.3), 6)
-            safe = max(self.config.min_dynamic_mbps, min(safe, curve_target))
-            reason = f"budget-curve pressure={state.budget_pressure_ewma:.3f}"
+            safe = max(baseline, min(safe, curve_target))
+            if safe == baseline:
+                reason = f"baseline-budget-curve pressure={state.budget_pressure_ewma:.3f}"
+            else:
+                reason = f"budget-curve pressure={state.budget_pressure_ewma:.3f}"
         else:
             state.budget_pressure_ewma = round(state.budget_pressure_ewma * 0.85, 6)
 
@@ -189,9 +222,30 @@ class PolicyEngine:
             safe = min(safe, max(self.config.freeze_mbps, int(self.config.max_mbps * remaining_ratio)))
             reason = "soft-quota"
 
-        safe = max(self.config.min_dynamic_mbps, min(self.config.max_mbps, int(safe)))
+        safe = max(baseline, min(self.config.max_mbps, int(safe)))
         state.learned_safe_mbps = safe
         return safe, reason
+
+    def _baseline_mbps(self) -> int:
+        return max(self.config.min_dynamic_mbps, self.config.baseline_mbps)
+
+    def _boost_levels(self) -> list[int]:
+        levels = self.config.boost_levels or [8, 12, 16, 24, 35, 50]
+        return sorted({level for level in levels if level >= self._baseline_mbps() and level <= self.config.max_mbps})
+
+    def _next_level(self, current: int, levels: list[int]) -> int:
+        for level in levels:
+            if level > current:
+                return level
+        return levels[-1]
+
+    def _previous_level(self, current: int, levels: list[int]) -> int:
+        previous = levels[0]
+        for level in levels:
+            if level >= current:
+                return previous
+            previous = level
+        return previous
 
     def _budget_curve_target_mbps(self, state: State, quota_bytes: int, now: datetime | None) -> int:
         now = now or datetime.now(timezone.utc)
@@ -317,7 +371,10 @@ class MetricsAggregator:
                 "freeze_active": False,
                 "behavior": decision.reason,
                 "learned_safe_mbps": state.learned_safe_mbps,
+                "learned_ceiling_mbps": state.learned_ceiling_mbps,
                 "budget_pressure_ewma": state.budget_pressure_ewma,
+                "risk_score_ewma": state.risk_score_ewma,
+                "baseline_health_ewma": state.baseline_health_ewma,
             }
 
         self.current["tx_bytes"] += tx_delta
@@ -330,7 +387,10 @@ class MetricsAggregator:
         self.current["freeze_active"] = self.current["freeze_active"] or decision.freeze_active
         self.current["behavior"] = decision.reason
         self.current["learned_safe_mbps"] = state.learned_safe_mbps
+        self.current["learned_ceiling_mbps"] = state.learned_ceiling_mbps
         self.current["budget_pressure_ewma"] = state.budget_pressure_ewma
+        self.current["risk_score_ewma"] = state.risk_score_ewma
+        self.current["baseline_health_ewma"] = state.baseline_health_ewma
 
     def flush(self) -> None:
         if not self.current:
@@ -473,7 +533,10 @@ def write_daily_report(config: Config, state: State, decision: Decision, log_dir
             f"- RX today: `{state.rx_bytes_today / GB:.2f} GB`",
             f"- Current limit: `{decision.target_mbps} Mbps`",
             f"- Learned safe limit: `{state.learned_safe_mbps} Mbps`",
+            f"- Learned ceiling: `{state.learned_ceiling_mbps} Mbps`",
             f"- Budget pressure EWMA: `{state.budget_pressure_ewma}`",
+            f"- Risk score EWMA: `{state.risk_score_ewma}`",
+            f"- Baseline health EWMA: `{state.baseline_health_ewma}`",
             f"- Freeze active: `{state.freeze_active}`",
             f"- Reason: `{decision.reason}`",
             f"- Bark sent for freeze: `{state.bark_sent_for_freeze}`",

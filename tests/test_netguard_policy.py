@@ -47,6 +47,30 @@ def test_policy_freezes_at_daily_quota_and_requests_bark_once():
     assert second.notify_bark is False
 
 
+def test_non_freeze_never_goes_below_8mbps_baseline():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=8, daily_tx_quota_gb=90)
+    state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=40 * 1024**3)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=3.0, now=datetime(2026, 5, 12, 17, 0, tzinfo=timezone.utc))
+
+    assert decision.freeze_active is False
+    assert decision.target_mbps == 8
+    assert "baseline" in decision.reason
+
+
+def test_medium_risk_backs_off_to_8mbps_baseline_not_4mbps():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8)
+    state = State(day="2026-05-13", learned_safe_mbps=35, current_mbps=35)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=4.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+
+    assert decision.freeze_active is False
+    assert decision.target_mbps == 8
+    assert state.learned_safe_mbps == 8
+
+
 def test_severe_loss_must_persist_before_freeze():
     cfg = Config(severe_drop_score=8.0, severe_loss_windows=3)
     state = State(day="2026-05-13", learned_safe_mbps=50)
@@ -61,16 +85,31 @@ def test_severe_loss_must_persist_before_freeze():
     assert third.freeze_active is True
 
 
+def test_stable_windows_boost_one_level_above_baseline():
+    cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8, boost_success_required_windows=3)
+    state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
+    engine = PolicyEngine(cfg)
+
+    first = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+    second = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 10, tzinfo=timezone.utc))
+    third = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 20, tzinfo=timezone.utc))
+
+    assert first.target_mbps == 8
+    assert second.target_mbps == 8
+    assert third.target_mbps == 12
+    assert state.learned_ceiling_mbps == 12
+
+
 def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
-    cfg = Config(max_mbps=50, min_dynamic_mbps=8, loss_backoff_factor=0.7, recovery_step_mbps=2)
+    cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8, loss_backoff_factor=0.7, recovery_step_mbps=2)
     state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=1 * 1024**3)
     engine = PolicyEngine(cfg)
 
     loss_decision = engine.decide(state, drop_score=3.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
     stable_decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 5, tzinfo=timezone.utc))
 
-    assert loss_decision.target_mbps == 35
-    assert stable_decision.target_mbps == 37
+    assert loss_decision.target_mbps == 8
+    assert stable_decision.target_mbps == 8
 
 
 def test_budget_curve_prevents_burning_daily_quota_in_first_hour():
@@ -86,26 +125,26 @@ def test_budget_curve_prevents_burning_daily_quota_in_first_hour():
 
 
 def test_budget_curve_allows_catchup_when_under_budget_late_day():
-    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90)
-    state = State(day="2026-05-13", learned_safe_mbps=20, tx_bytes_today=20 * 1024**3)
+    cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90, boost_success_required_windows=1)
+    state = State(day="2026-05-13", learned_safe_mbps=8, tx_bytes_today=20 * 1024**3)
     engine = PolicyEngine(cfg)
 
     decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 12, 0, tzinfo=timezone.utc))
 
-    assert decision.target_mbps >= 20
+    assert decision.target_mbps == 12
     assert decision.freeze_active is False
 
 
 def test_budget_curve_has_low_expected_usage_between_2_and_8_beijing_time():
     cfg = Config(max_mbps=50, min_dynamic_mbps=1, daily_tx_quota_gb=90)
     engine = PolicyEngine(cfg)
-    night = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=10 * 1024**3)
-    morning = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=10 * 1024**3)
+    night = State(day="2026-05-13", learned_safe_mbps=50, learned_ceiling_mbps=50, tx_bytes_today=10 * 1024**3)
+    morning = State(day="2026-05-13", learned_safe_mbps=50, learned_ceiling_mbps=50, tx_bytes_today=10 * 1024**3)
 
     night_decision = engine.decide(night, drop_score=0.0, now=datetime(2026, 5, 12, 19, 0, tzinfo=timezone.utc))
     morning_decision = engine.decide(morning, drop_score=0.0, now=datetime(2026, 5, 13, 2, 0, tzinfo=timezone.utc))
 
-    assert night_decision.target_mbps < morning_decision.target_mbps
+    assert night_decision.target_mbps <= morning_decision.target_mbps
     assert "budget-curve" in night_decision.reason
 
 
@@ -191,7 +230,7 @@ def test_daemon_loop_applies_tc_only_when_limit_changes(monkeypatch, tmp_path):
     cfg_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
     Config(iface="eth0", sample_interval_seconds=0).save(cfg_path)
-    State(day="2026-05-13", last_applied_mbps=50).save(state_path)
+    State(day="2026-05-13", learned_safe_mbps=8, last_applied_mbps=8).save(state_path)
     applied = []
 
     monkeypatch.setattr("openx_netguard.netguard.read_net_counters", lambda iface: (100, 100, 0))
@@ -245,3 +284,6 @@ def test_metrics_aggregator_writes_five_minute_jsonl(tmp_path):
     assert rows[0]["packet_loss_rate"] == 0.003
     assert rows[0]["target_mbps_avg"] == 35.0
     assert rows[0]["behavior"] == "dynamic"
+    assert rows[0]["learned_ceiling_mbps"] == 8
+    assert rows[0]["risk_score_ewma"] == 0.0
+    assert rows[0]["baseline_health_ewma"] == 1.0
