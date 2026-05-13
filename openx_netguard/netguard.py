@@ -40,12 +40,14 @@ class Config:
     min_dynamic_mbps: int = 8
     baseline_mbps: int = 8
     boost_levels: list[int] | None = None
-    boost_success_required_windows: int = 3
+    boost_success_required_windows: int = 1
     risk_score_backoff_threshold: float = 3.0
     risk_score_freeze_threshold: float = 8.0
     baseline_freeze_windows: int = 6
+    risk_cooldown_windows: int = 1
     exploration_rate: float = 0.2
     sample_interval_seconds: int = 30
+    decision_interval_seconds: int = 300
     metric_interval_seconds: int = 300
     loss_backoff_factor: float = 0.7
     recovery_step_mbps: int = 2
@@ -94,7 +96,11 @@ class State:
     baseline_health_ewma: float = 1.0
     boost_success_windows: int = 0
     boost_fail_windows: int = 0
+    risk_cooldown_windows: int = 0
     rate_arms: dict | None = None
+    last_decision_bucket: str = ""
+    held_target_mbps: int = 0
+    held_decision_reason: str = ""
     updated_at: str = ""
 
     @classmethod
@@ -136,14 +142,18 @@ class PolicyEngine:
             state.baseline_health_ewma = 1.0
             state.boost_success_windows = 0
             state.boost_fail_windows = 0
+            state.risk_cooldown_windows = 0
             state.last_tx_bytes = 0
             state.last_rx_bytes = 0
             state.last_drop_total = 0
             state.last_tcp_retrans = 0
             state.last_packet_total = 0
             state.consecutive_loss_windows = 0
+            state.last_decision_bucket = ""
+            state.held_target_mbps = 0
+            state.held_decision_reason = ""
 
-    def decide(self, state: State, drop_score: float, now: datetime | None = None) -> Decision:
+    def decide(self, state: State, drop_score: float, now: datetime | None = None, probe_allowed: bool = True) -> Decision:
         self.ensure_day(state, now)
 
         quota_bytes = int(self.config.daily_tx_quota_gb * GB)
@@ -171,12 +181,43 @@ class PolicyEngine:
             if not state.bark_sent_for_freeze:
                 notify = True
                 state.bark_sent_for_freeze = True
+        elif self._should_hold_decision(state, drop_score, soft_bytes, now):
+            target = state.held_target_mbps
+            reason = "decision-hold"
         else:
-            target, reason = self._dynamic_target_mbps(state, drop_score, soft_bytes, quota_bytes, now)
+            target, reason = self._dynamic_target_mbps(state, drop_score, soft_bytes, quota_bytes, now, probe_allowed)
+            self._remember_decision(state, target, reason, now)
 
         state.current_mbps = int(target)
         state.updated_at = datetime.now(timezone.utc).isoformat()
         return Decision(int(target), state.freeze_active, notify, reason)
+
+    def _should_hold_decision(self, state: State, drop_score: float, soft_bytes: int, now: datetime | None) -> bool:
+        if self.config.decision_interval_seconds <= 0:
+            return False
+        if state.held_target_mbps <= 0 or not state.last_decision_bucket:
+            return False
+        if state.tx_bytes_today >= soft_bytes:
+            return False
+        if drop_score >= self.config.risk_score_backoff_threshold:
+            return False
+        return state.last_decision_bucket == self._decision_bucket(now)
+
+    def _remember_decision(self, state: State, target: int, reason: str, now: datetime | None) -> None:
+        if self.config.decision_interval_seconds <= 0:
+            return
+        state.last_decision_bucket = self._decision_bucket(now)
+        state.held_target_mbps = int(target)
+        state.held_decision_reason = reason
+
+    def _decision_bucket(self, now: datetime | None) -> str:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        seconds = max(1, int(self.config.decision_interval_seconds))
+        stamp = int(now.timestamp())
+        bucket = stamp - (stamp % seconds)
+        return datetime.fromtimestamp(bucket, timezone.utc).isoformat()
 
     def _dynamic_target_mbps(
         self,
@@ -185,6 +226,7 @@ class PolicyEngine:
         soft_bytes: int,
         quota_bytes: int,
         now: datetime | None,
+        probe_allowed: bool = True,
     ) -> tuple[int, str]:
         baseline = self._baseline_mbps()
         levels = self._boost_levels()
@@ -197,20 +239,32 @@ class PolicyEngine:
             state.boost_fail_windows += 1
             state.boost_success_windows = 0
             state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.0, 6)
-            safe = self._previous_level(safe, levels)
-            state.learned_ceiling_mbps = max(baseline, min(state.learned_ceiling_mbps, safe))
+            safe = self._backoff_level(safe, levels)
+            state.learned_ceiling_mbps = max(baseline, safe)
+            state.risk_cooldown_windows = max(state.risk_cooldown_windows, self.config.risk_cooldown_windows)
             reason = "bandit-risk-backoff"
         else:
-            self._update_arm(state, safe, healthy=True, drop_score=drop_score)
-            state.boost_success_windows += 1
-            state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.2, 6)
-            if safe < self.config.max_mbps and state.boost_success_windows >= self.config.boost_success_required_windows:
-                safe = self._select_next_rate(state, safe, levels)
-                state.learned_ceiling_mbps = max(state.learned_ceiling_mbps, safe)
+            if not probe_allowed:
+                safe = max(baseline, min(self.config.max_mbps, state.last_applied_mbps or state.current_mbps or safe))
+                reason = "warmup-hold"
+            elif state.risk_cooldown_windows > 0:
+                self._update_arm(state, safe, healthy=True, drop_score=drop_score)
+                state.risk_cooldown_windows -= 1
                 state.boost_success_windows = 0
-                reason = "bandit-probe"
+                state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.2, 6)
+                safe = max(baseline, min(safe, state.learned_ceiling_mbps or safe))
+                reason = "bandit-cooldown"
             else:
-                safe = max(baseline, min(safe, state.learned_ceiling_mbps or self.config.max_mbps))
+                self._update_arm(state, safe, healthy=True, drop_score=drop_score)
+                state.boost_success_windows += 1
+                state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.2, 6)
+                if safe < self.config.max_mbps and state.boost_success_windows >= self.config.boost_success_required_windows:
+                    safe = self._select_next_rate(state, safe, levels)
+                    state.learned_ceiling_mbps = max(state.learned_ceiling_mbps, safe)
+                    state.boost_success_windows = 0
+                    reason = "bandit-probe"
+                else:
+                    safe = max(baseline, min(safe, state.learned_ceiling_mbps or self.config.max_mbps))
 
         curve_target = self._budget_curve_target_mbps(state, quota_bytes, now)
         if curve_target < safe:
@@ -273,7 +327,9 @@ class PolicyEngine:
         return max(self.config.min_dynamic_mbps, self.config.baseline_mbps)
 
     def _boost_levels(self) -> list[int]:
-        levels = self.config.boost_levels or [8, 12, 16, 24, 35, 50]
+        levels = self.config.boost_levels or list(range(self._baseline_mbps(), self.config.max_mbps + 1))
+        if self.config.max_mbps not in levels:
+            levels.append(self.config.max_mbps)
         return sorted({level for level in levels if level >= self._baseline_mbps() and level <= self.config.max_mbps})
 
     def _next_level(self, current: int, levels: list[int]) -> int:
@@ -289,6 +345,14 @@ class PolicyEngine:
                 return previous
             previous = level
         return previous
+
+    def _backoff_level(self, current: int, levels: list[int]) -> int:
+        baseline = self._baseline_mbps()
+        target = max(baseline, int(current * self.config.loss_backoff_factor))
+        candidates = [level for level in levels if level < current]
+        if not candidates:
+            return baseline
+        return max(baseline, min(candidates, key=lambda level: (abs(level - target), level)))
 
     def _budget_curve_target_mbps(self, state: State, quota_bytes: int, now: datetime | None) -> int:
         now = now or datetime.now(timezone.utc)
@@ -447,8 +511,20 @@ class MetricsAggregator:
         target_sum = row.pop("target_mbps_sum")
         row["avg_tx_mbps"] = round(row["tx_bytes"] * 8 / seconds / 1_000_000, 3)
         row["avg_rx_mbps"] = round(row["rx_bytes"] * 8 / seconds / 1_000_000, 3)
-        row["packet_loss_rate"] = round((row["drop_delta"] + row["tcp_retrans_delta"]) / packets, 6)
         row["target_mbps_avg"] = round(target_sum / samples, 2)
+        observed_delivery = delivery_ratio(row["tx_bytes"], row["rx_bytes"], row["target_mbps_avg"], seconds)
+        components = risk_components(
+            row["drop_delta"],
+            row["tcp_retrans_delta"],
+            packets,
+            delivery_ratio=observed_delivery,
+            target_mbps=row["target_mbps_avg"],
+        )
+        row["queue_drop_rate"] = components["queue_drop_rate"]
+        row["tcp_retrans_rate"] = components["tcp_retrans_rate"]
+        row["delivery_ratio"] = components["delivery_ratio"]
+        row["risk_components"] = components
+        row["packet_loss_rate"] = round((row["drop_delta"] + row["tcp_retrans_delta"]) / packets, 6)
         day = datetime.fromisoformat(row["window_start_bj"]).date().isoformat()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         with (self.log_dir / f"metrics-{day}.jsonl").open("a") as fh:
@@ -533,12 +609,55 @@ def read_tcp_retrans() -> int:
     return 0
 
 
-def loss_score(drop_delta: int, retrans_delta: int, packet_delta: int) -> float:
+def delivery_ratio(tx_delta: int, rx_delta: int, target_mbps: float, seconds: int | float) -> float:
+    if target_mbps <= 0 or seconds <= 0:
+        return 1.0
+    observed_mbps = max(tx_delta, rx_delta) * 8 / seconds / 1_000_000
+    return round(max(0.0, min(2.0, observed_mbps / target_mbps)), 3)
+
+
+def risk_components(
+    drop_delta: int,
+    retrans_delta: int,
+    packet_delta: int,
+    delivery_ratio: float | None = None,
+    target_mbps: float | None = None,
+) -> dict[str, float]:
     packets = max(1, packet_delta)
-    drop_rate = drop_delta / packets
-    retrans_rate = retrans_delta / packets
-    score = (drop_rate * 8000) + (retrans_rate * 80)
-    return round(min(20.0, score), 4)
+    queue_drop_rate = drop_delta / packets
+    tcp_retrans_rate = retrans_delta / packets
+    observed_delivery = 1.0 if delivery_ratio is None else max(0.0, min(2.0, delivery_ratio))
+    queue_drop_score = queue_drop_rate * 14_000
+    tcp_retrans_score = tcp_retrans_rate * 12
+    delivery_score = 0.0
+    if target_mbps and target_mbps >= 8 and observed_delivery < 0.55 and (queue_drop_rate > 0 or tcp_retrans_rate >= 0.02):
+        delivery_score = (0.55 - observed_delivery) * 10
+    total = min(20.0, queue_drop_score + tcp_retrans_score + delivery_score)
+    return {
+        "queue_drop_rate": round(queue_drop_rate, 6),
+        "tcp_retrans_rate": round(tcp_retrans_rate, 6),
+        "delivery_ratio": round(observed_delivery, 3),
+        "queue_drop_score": round(queue_drop_score, 4),
+        "tcp_retrans_score": round(tcp_retrans_score, 4),
+        "delivery_score": round(delivery_score, 4),
+        "score": round(total, 4),
+    }
+
+
+def loss_score(
+    drop_delta: int,
+    retrans_delta: int,
+    packet_delta: int,
+    delivery_ratio: float | None = None,
+    target_mbps: float | None = None,
+) -> float:
+    return risk_components(
+        drop_delta,
+        retrans_delta,
+        packet_delta,
+        delivery_ratio=delivery_ratio,
+        target_mbps=target_mbps,
+    )["score"]
 
 
 def apply_tc(config: Config, mbps: int, dry_run: bool = False) -> None:
@@ -631,7 +750,15 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         drop_delta = 0 if first_sample else max(0, drops - state.last_drop_total)
         retrans_delta = 0 if first_sample else max(0, tcp_retrans - state.last_tcp_retrans)
         packet_delta = 0 if first_sample else max(0, packets - state.last_packet_total)
-        drop_score = loss_score(drop_delta, retrans_delta, packet_delta)
+        target_for_delivery = state.last_applied_mbps or state.current_mbps or config.baseline_mbps
+        sample_delivery_ratio = delivery_ratio(tx_delta, rx_delta, target_for_delivery, config.sample_interval_seconds)
+        drop_score = loss_score(
+            drop_delta,
+            retrans_delta,
+            packet_delta,
+            delivery_ratio=sample_delivery_ratio,
+            target_mbps=target_for_delivery,
+        )
 
         state.last_tx_bytes = tx
         state.last_rx_bytes = rx
@@ -639,7 +766,7 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         state.last_tcp_retrans = tcp_retrans
         state.last_packet_total = packets
 
-        decision = engine.decide(state, drop_score)
+        decision = engine.decide(state, drop_score, probe_allowed=not first_sample)
         applied_tc = False
         if state.last_applied_mbps != decision.target_mbps:
             apply_tc(config, decision.target_mbps, dry_run=dry_run)
@@ -658,7 +785,7 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         write_daily_report(config, state, decision, log_dir)
         log_line(
             f"iface={config.iface} target={decision.target_mbps}Mbps tx_gb={state.tx_bytes_today / GB:.2f} "
-            f"rx_gb={state.rx_bytes_today / GB:.2f} drop_score={drop_score:.2f} freeze={state.freeze_active} "
+            f"rx_gb={state.rx_bytes_today / GB:.2f} drop_score={drop_score:.2f} delivery={sample_delivery_ratio:.2f} freeze={state.freeze_active} "
             f"applied_tc={applied_tc} reason={decision.reason}",
             log_dir,
         )

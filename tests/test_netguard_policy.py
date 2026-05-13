@@ -17,7 +17,9 @@ from openx_netguard.netguard import (  # noqa: E402
     _acceptable_tc_error,
     apply_tc,
     daemon_loop,
+    delivery_ratio,
     loss_score,
+    risk_components,
 )
 
 
@@ -103,6 +105,93 @@ def test_loss_score_uses_packet_normalized_retrans_rate():
     assert loss_score(drop_delta=100, retrans_delta=20_000, packet_delta=200_000) >= 8
 
 
+def test_retrans_only_is_a_soft_signal_and_does_not_block_probe():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 10, 12, 14],
+        boost_success_required_windows=1,
+        risk_score_backoff_threshold=3.0,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
+    engine = PolicyEngine(cfg)
+
+    score = loss_score(drop_delta=0, retrans_delta=70_000, packet_delta=1_000_000)
+    decision = engine.decide(state, drop_score=score, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+
+    assert score < cfg.risk_score_backoff_threshold
+    assert decision.target_mbps == 10
+    assert decision.reason == "bandit-probe"
+
+
+def test_queue_drop_is_a_hard_risk_signal_and_backs_off_to_baseline_when_close():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 10, 12, 14],
+        risk_score_backoff_threshold=3.0,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=14, current_mbps=14)
+    engine = PolicyEngine(cfg)
+
+    score = loss_score(drop_delta=80, retrans_delta=0, packet_delta=200_000)
+    decision = engine.decide(state, drop_score=score, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+
+    assert score >= cfg.risk_score_backoff_threshold
+    assert decision.target_mbps == 8
+    assert decision.reason == "bandit-risk-backoff"
+
+
+def test_low_delivery_with_transport_risk_backs_off_but_idle_low_delivery_does_not():
+    risky = loss_score(drop_delta=0, retrans_delta=40_000, packet_delta=500_000, delivery_ratio=0.2, target_mbps=20)
+    idle = loss_score(drop_delta=0, retrans_delta=0, packet_delta=500_000, delivery_ratio=0.2, target_mbps=20)
+
+    assert risky >= 3.0
+    assert idle < 1.0
+
+
+def test_default_boost_levels_are_linear_two_mbps_steps():
+    cfg = Config(max_mbps=50, baseline_mbps=8, min_dynamic_mbps=8, boost_levels=None)
+
+    assert PolicyEngine(cfg)._boost_levels() == list(range(8, 51))
+
+
+def test_bandit_holds_healthy_probe_changes_inside_decision_bucket():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 10, 12],
+        boost_success_required_windows=1,
+        decision_interval_seconds=300,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
+    engine = PolicyEngine(cfg)
+
+    first = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 0, tzinfo=timezone.utc))
+    same_bucket = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 3, tzinfo=timezone.utc))
+    next_bucket = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 5, tzinfo=timezone.utc))
+
+    assert first.target_mbps == 10
+    assert same_bucket.target_mbps == 10
+    assert same_bucket.reason == "decision-hold"
+    assert next_bucket.target_mbps == 12
+
+
+def test_delivery_ratio_uses_observed_throughput_against_target():
+    ratio = delivery_ratio(tx_delta=18_750_000, rx_delta=1_000_000, target_mbps=10, seconds=30)
+
+    assert ratio == 0.5
+
+
+def test_risk_components_split_queue_drop_and_tcp_retrans_rates():
+    components = risk_components(drop_delta=25, retrans_delta=5, packet_delta=10_000, delivery_ratio=0.9)
+
+    assert components["queue_drop_rate"] == 0.0025
+    assert components["tcp_retrans_rate"] == 0.0005
+    assert components["delivery_ratio"] == 0.9
+    assert components["queue_drop_score"] > components["tcp_retrans_score"]
+
+
 def test_stable_windows_boost_one_level_above_baseline():
     cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8, boost_success_required_windows=3)
     state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
@@ -114,8 +203,8 @@ def test_stable_windows_boost_one_level_above_baseline():
 
     assert first.target_mbps == 8
     assert second.target_mbps == 8
-    assert third.target_mbps == 12
-    assert state.learned_ceiling_mbps == 12
+    assert third.target_mbps == 9
+    assert state.learned_ceiling_mbps == 9
 
 
 def test_bandit_can_climb_to_20mbps_when_windows_are_healthy():
@@ -139,7 +228,7 @@ def test_bandit_can_climb_to_20mbps_when_windows_are_healthy():
     assert state.rate_arms["20"]["score"] > state.rate_arms["8"]["score"]
 
 
-def test_bandit_risk_penalizes_current_arm_and_backs_off_one_level():
+def test_bandit_risk_penalizes_current_arm_and_backs_off_to_weighted_safe_level():
     cfg = Config(
         max_mbps=50,
         baseline_mbps=8,
@@ -151,7 +240,7 @@ def test_bandit_risk_penalizes_current_arm_and_backs_off_one_level():
 
     decision = engine.decide(state, drop_score=4.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
 
-    assert decision.target_mbps == 20
+    assert decision.target_mbps == 15
     assert state.rate_arms["25"]["risk_windows"] == 1
     assert state.rate_arms["25"]["score"] < 0.9
 
@@ -174,7 +263,7 @@ def test_budget_pressure_blocks_bandit_boost_above_curve_target():
     assert "budget-curve" in decision.reason
 
 
-def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
+def test_loss_signal_reduces_rate_and_stable_signal_holds_cooldown():
     cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8, loss_backoff_factor=0.7, recovery_step_mbps=2)
     state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=1 * 1024**3)
     engine = PolicyEngine(cfg)
@@ -183,7 +272,8 @@ def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
     stable_decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 5, tzinfo=timezone.utc))
 
     assert loss_decision.target_mbps == 35
-    assert stable_decision.target_mbps == 8
+    assert stable_decision.target_mbps == 35
+    assert stable_decision.reason == "bandit-cooldown"
 
 
 def test_budget_curve_prevents_burning_daily_quota_in_first_hour():
@@ -205,7 +295,7 @@ def test_budget_curve_allows_catchup_when_under_budget_late_day():
 
     decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 12, 0, tzinfo=timezone.utc))
 
-    assert decision.target_mbps == 12
+    assert decision.target_mbps == 9
     assert decision.freeze_active is False
 
 
