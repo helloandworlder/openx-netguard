@@ -36,7 +36,7 @@ journalctl -u openx-netguard -f
 
 - 最大出入口带宽：`50Mbps`
 - 常态基准带宽：`8Mbps`
-- 弹性升档：`8 -> 12 -> 16 -> 24 -> 35 -> 50Mbps`
+- 弹性升档：`8 -> 12 -> 15 -> 20 -> 25 -> 30 -> 35 -> 40 -> 50Mbps`
 - 每日北京时间出向目标：`90GB`
 - 提前保护线：`88GB`
 - 保护态出入口带宽：`4Mbps`
@@ -53,6 +53,6 @@ journalctl -u openx-netguard -f
 - 平均速度：`avg_tx_mbps`、`avg_rx_mbps`
 - 丢包/重传：`drop_delta`、`tcp_retrans_delta`、`packet_loss_rate`
 - 当前行为：`behavior`、`freeze_active`、`target_mbps_avg`
-- 学习参数：`learned_safe_mbps`、`learned_ceiling_mbps`、`budget_pressure_ewma`、`risk_score_ewma`、`baseline_health_ewma`
+- 学习参数：`learned_safe_mbps`、`learned_ceiling_mbps`、`budget_pressure_ewma`、`risk_score_ewma`、`baseline_health_ewma`、`rate_arms`
 
 这套策略只能尽量平滑流量和降低触发平台侧惩罚的概率，不能保证规避腾讯云未公开的限速规则。

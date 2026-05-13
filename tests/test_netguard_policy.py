@@ -68,8 +68,8 @@ def test_medium_risk_backs_off_to_8mbps_baseline_not_4mbps():
     decision = engine.decide(state, drop_score=4.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
 
     assert decision.freeze_active is False
-    assert decision.target_mbps == 8
-    assert state.learned_safe_mbps == 8
+    assert decision.target_mbps == 24
+    assert state.learned_safe_mbps == 24
 
 
 def test_severe_loss_must_persist_before_freeze():
@@ -82,9 +82,9 @@ def test_severe_loss_must_persist_before_freeze():
         for i in range(6)
     ]
 
-    assert decisions[0].target_mbps == 8
-    assert decisions[4].freeze_active is False
-    assert decisions[5].freeze_active is True
+    assert decisions[0].target_mbps == 35
+    assert decisions[1].freeze_active is False
+    assert decisions[2].freeze_active is True
 
 
 def test_baseline_mode_requires_higher_risk_before_freeze():
@@ -118,6 +118,62 @@ def test_stable_windows_boost_one_level_above_baseline():
     assert state.learned_ceiling_mbps == 12
 
 
+def test_bandit_can_climb_to_20mbps_when_windows_are_healthy():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 12, 15, 20, 25, 30, 35, 40, 50],
+        boost_success_required_windows=1,
+        exploration_rate=0.0,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
+    engine = PolicyEngine(cfg)
+
+    decisions = [
+        engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, i * 10, tzinfo=timezone.utc))
+        for i in range(4)
+    ]
+
+    assert [decision.target_mbps for decision in decisions] == [12, 15, 20, 25]
+    assert state.rate_arms["20"]["success_windows"] >= 1
+    assert state.rate_arms["20"]["score"] > state.rate_arms["8"]["score"]
+
+
+def test_bandit_risk_penalizes_current_arm_and_backs_off_one_level():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 12, 15, 20, 25],
+        risk_score_backoff_threshold=3.0,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=25, current_mbps=25, rate_arms={"25": {"score": 0.9, "tries": 3, "success_windows": 3, "risk_windows": 0}})
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=4.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+
+    assert decision.target_mbps == 20
+    assert state.rate_arms["25"]["risk_windows"] == 1
+    assert state.rate_arms["25"]["score"] < 0.9
+
+
+def test_budget_pressure_blocks_bandit_boost_above_curve_target():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=[8, 12, 15, 20, 25],
+        boost_success_required_windows=1,
+        exploration_rate=0.0,
+        daily_tx_quota_gb=90,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=20, current_mbps=20, learned_ceiling_mbps=20, tx_bytes_today=40 * 1024**3)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 12, 17, tzinfo=timezone.utc))
+
+    assert decision.target_mbps == 8
+    assert "budget-curve" in decision.reason
+
+
 def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
     cfg = Config(max_mbps=50, min_dynamic_mbps=8, baseline_mbps=8, loss_backoff_factor=0.7, recovery_step_mbps=2)
     state = State(day="2026-05-13", learned_safe_mbps=50, tx_bytes_today=1 * 1024**3)
@@ -126,7 +182,7 @@ def test_loss_signal_reduces_rate_and_stable_signal_recovers_slowly():
     loss_decision = engine.decide(state, drop_score=3.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
     stable_decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 5, tzinfo=timezone.utc))
 
-    assert loss_decision.target_mbps == 8
+    assert loss_decision.target_mbps == 35
     assert stable_decision.target_mbps == 8
 
 
@@ -305,3 +361,4 @@ def test_metrics_aggregator_writes_five_minute_jsonl(tmp_path):
     assert rows[0]["learned_ceiling_mbps"] == 8
     assert rows[0]["risk_score_ewma"] == 0.0
     assert rows[0]["baseline_health_ewma"] == 1.0
+    assert rows[0]["rate_arms"] == {}

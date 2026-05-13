@@ -44,6 +44,7 @@ class Config:
     risk_score_backoff_threshold: float = 3.0
     risk_score_freeze_threshold: float = 8.0
     baseline_freeze_windows: int = 6
+    exploration_rate: float = 0.2
     sample_interval_seconds: int = 30
     metric_interval_seconds: int = 300
     loss_backoff_factor: float = 0.7
@@ -93,6 +94,7 @@ class State:
     baseline_health_ewma: float = 1.0
     boost_success_windows: int = 0
     boost_fail_windows: int = 0
+    rate_arms: dict | None = None
     updated_at: str = ""
 
     @classmethod
@@ -187,23 +189,26 @@ class PolicyEngine:
         baseline = self._baseline_mbps()
         levels = self._boost_levels()
         safe = state.learned_safe_mbps or baseline
+        self._ensure_rate_arms(state, levels)
         reason = "dynamic"
 
         if drop_score >= self.config.risk_score_backoff_threshold:
+            self._update_arm(state, safe, healthy=False, drop_score=drop_score)
             state.boost_fail_windows += 1
             state.boost_success_windows = 0
             state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.0, 6)
-            state.learned_ceiling_mbps = max(baseline, self._previous_level(safe, levels))
-            safe = baseline
-            reason = "baseline-risk-backoff"
+            safe = self._previous_level(safe, levels)
+            state.learned_ceiling_mbps = max(baseline, min(state.learned_ceiling_mbps, safe))
+            reason = "bandit-risk-backoff"
         else:
+            self._update_arm(state, safe, healthy=True, drop_score=drop_score)
             state.boost_success_windows += 1
             state.baseline_health_ewma = round((state.baseline_health_ewma * 0.8) + 0.2, 6)
             if safe < self.config.max_mbps and state.boost_success_windows >= self.config.boost_success_required_windows:
-                safe = self._next_level(safe, levels)
+                safe = self._select_next_rate(state, safe, levels)
                 state.learned_ceiling_mbps = max(state.learned_ceiling_mbps, safe)
                 state.boost_success_windows = 0
-                reason = "boost-step-up"
+                reason = "bandit-probe"
             else:
                 safe = max(baseline, min(safe, state.learned_ceiling_mbps or self.config.max_mbps))
 
@@ -227,6 +232,42 @@ class PolicyEngine:
         safe = max(baseline, min(self.config.max_mbps, int(safe)))
         state.learned_safe_mbps = safe
         return safe, reason
+
+    def _ensure_rate_arms(self, state: State, levels: list[int]) -> None:
+        if state.rate_arms is None:
+            state.rate_arms = {}
+        for level in levels:
+            key = str(level)
+            state.rate_arms.setdefault(
+                key,
+                {"score": 0.0, "tries": 0, "success_windows": 0, "risk_windows": 0},
+            )
+
+    def _update_arm(self, state: State, mbps: int, healthy: bool, drop_score: float) -> None:
+        if state.rate_arms is None:
+            state.rate_arms = {}
+        key = str(int(mbps))
+        arm = state.rate_arms.setdefault(key, {"score": 0.0, "tries": 0, "success_windows": 0, "risk_windows": 0})
+        arm["tries"] = int(arm.get("tries", 0)) + 1
+        if healthy:
+            arm["success_windows"] = int(arm.get("success_windows", 0)) + 1
+            reward = min(1.0, mbps / max(1, self.config.max_mbps))
+            arm["score"] = round((float(arm.get("score", 0.0)) * 0.75) + (reward * 0.25), 6)
+        else:
+            arm["risk_windows"] = int(arm.get("risk_windows", 0)) + 1
+            penalty = min(1.0, drop_score / 20)
+            arm["score"] = round((float(arm.get("score", 0.0)) * 0.65) - (penalty * 0.35), 6)
+
+    def _select_next_rate(self, state: State, current: int, levels: list[int]) -> int:
+        next_level = self._next_level(current, levels)
+        if self.config.exploration_rate > 0 and state.boost_success_windows % 5 == 0:
+            return next_level
+        candidates = [level for level in levels if level <= next_level]
+        if not candidates:
+            return next_level
+        scores = state.rate_arms or {}
+        best = max(candidates, key=lambda level: (float(scores.get(str(level), {}).get("score", 0.0)), level))
+        return max(next_level, best)
 
     def _baseline_mbps(self) -> int:
         return max(self.config.min_dynamic_mbps, self.config.baseline_mbps)
@@ -377,6 +418,7 @@ class MetricsAggregator:
                 "budget_pressure_ewma": state.budget_pressure_ewma,
                 "risk_score_ewma": state.risk_score_ewma,
                 "baseline_health_ewma": state.baseline_health_ewma,
+                "rate_arms": state.rate_arms or {},
             }
 
         self.current["tx_bytes"] += tx_delta
@@ -393,6 +435,7 @@ class MetricsAggregator:
         self.current["budget_pressure_ewma"] = state.budget_pressure_ewma
         self.current["risk_score_ewma"] = state.risk_score_ewma
         self.current["baseline_health_ewma"] = state.baseline_health_ewma
+        self.current["rate_arms"] = state.rate_arms or {}
 
     def flush(self) -> None:
         if not self.current:
@@ -547,6 +590,7 @@ def write_daily_report(config: Config, state: State, decision: Decision, log_dir
             f"- Budget pressure EWMA: `{state.budget_pressure_ewma}`",
             f"- Risk score EWMA: `{state.risk_score_ewma}`",
             f"- Baseline health EWMA: `{state.baseline_health_ewma}`",
+            f"- Rate arms: `{json.dumps(state.rate_arms or {}, ensure_ascii=False)}`",
             f"- Freeze active: `{state.freeze_active}`",
             f"- Reason: `{decision.reason}`",
             f"- Bark sent for freeze: `{state.bark_sent_for_freeze}`",
