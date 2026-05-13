@@ -41,6 +41,7 @@ class Config:
     baseline_mbps: int = 8
     boost_levels: list[int] | None = None
     boost_success_required_windows: int = 1
+    probe_step_bands: list[dict] | None = None
     risk_score_backoff_threshold: float = 3.0
     risk_score_freeze_threshold: float = 8.0
     baseline_freeze_windows: int = 6
@@ -313,7 +314,7 @@ class PolicyEngine:
             arm["score"] = round((float(arm.get("score", 0.0)) * 0.65) - (penalty * 0.35), 6)
 
     def _select_next_rate(self, state: State, current: int, levels: list[int]) -> int:
-        next_level = self._next_level(current, levels)
+        next_level = self._next_probe_level(current, levels)
         if self.config.exploration_rate > 0 and state.boost_success_windows % 5 == 0:
             return next_level
         candidates = [level for level in levels if level <= next_level]
@@ -337,6 +338,29 @@ class PolicyEngine:
             if level > current:
                 return level
         return levels[-1]
+
+    def _next_probe_level(self, current: int, levels: list[int]) -> int:
+        target = min(self.config.max_mbps, current + self._probe_step_mbps(current))
+        for level in levels:
+            if level >= target and level > current:
+                return level
+        return levels[-1]
+
+    def _probe_step_mbps(self, current: int) -> int:
+        bands = self.config.probe_step_bands or [
+            {"below_mbps": 15, "step_mbps": 1},
+            {"below_mbps": 25, "step_mbps": 2},
+            {"below_mbps": self.config.max_mbps + 1, "step_mbps": 5},
+        ]
+        for band in bands:
+            try:
+                below = int(band["below_mbps"])
+                step = int(band["step_mbps"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if current < below:
+                return max(1, step)
+        return 1
 
     def _previous_level(self, current: int, levels: list[int]) -> int:
         previous = levels[0]

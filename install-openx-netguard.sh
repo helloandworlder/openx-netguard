@@ -47,6 +47,11 @@ if [ ! -f "$CONFIG_DIR/config.json" ]; then
   "baseline_mbps": 8,
   "boost_levels": null,
   "boost_success_required_windows": 1,
+  "probe_step_bands": [
+    {"below_mbps": 15, "step_mbps": 1},
+    {"below_mbps": 25, "step_mbps": 2},
+    {"below_mbps": 51, "step_mbps": 5}
+  ],
   "risk_score_backoff_threshold": 3.0,
   "risk_score_freeze_threshold": 8.0,
   "baseline_freeze_windows": 6,

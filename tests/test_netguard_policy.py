@@ -156,6 +156,51 @@ def test_default_boost_levels_are_linear_two_mbps_steps():
     assert PolicyEngine(cfg)._boost_levels() == list(range(8, 51))
 
 
+def test_tiered_probe_step_accelerates_after_safe_midpoints():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=None,
+        boost_success_required_windows=1,
+        decision_interval_seconds=0,
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=14, current_mbps=14, learned_ceiling_mbps=14)
+    engine = PolicyEngine(cfg)
+
+    low = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+    mid = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 5, tzinfo=timezone.utc))
+    high_start = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 10, tzinfo=timezone.utc))
+    state.learned_safe_mbps = 25
+    state.current_mbps = 25
+    state.learned_ceiling_mbps = 25
+    high = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, 15, tzinfo=timezone.utc))
+
+    assert low.target_mbps == 15
+    assert mid.target_mbps == 17
+    assert high_start.target_mbps == 19
+    assert high.target_mbps == 30
+
+
+def test_probe_step_bands_can_be_overridden():
+    cfg = Config(
+        max_mbps=50,
+        baseline_mbps=8,
+        boost_levels=None,
+        boost_success_required_windows=1,
+        decision_interval_seconds=0,
+        probe_step_bands=[
+            {"below_mbps": 12, "step_mbps": 1},
+            {"below_mbps": 50, "step_mbps": 4},
+        ],
+    )
+    state = State(day="2026-05-13", learned_safe_mbps=12, current_mbps=12, learned_ceiling_mbps=12)
+    engine = PolicyEngine(cfg)
+
+    decision = engine.decide(state, drop_score=0.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
+
+    assert decision.target_mbps == 16
+
+
 def test_bandit_holds_healthy_probe_changes_inside_decision_bucket():
     cfg = Config(
         max_mbps=50,
