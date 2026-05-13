@@ -17,6 +17,7 @@ from openx_netguard.netguard import (  # noqa: E402
     _acceptable_tc_error,
     apply_tc,
     daemon_loop,
+    loss_score,
 )
 
 
@@ -73,16 +74,33 @@ def test_medium_risk_backs_off_to_8mbps_baseline_not_4mbps():
 
 def test_severe_loss_must_persist_before_freeze():
     cfg = Config(severe_drop_score=8.0, severe_loss_windows=3)
-    state = State(day="2026-05-13", learned_safe_mbps=50)
+    state = State(day="2026-05-13", learned_safe_mbps=50, current_mbps=50)
     engine = PolicyEngine(cfg)
 
-    first = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, tzinfo=timezone.utc))
-    second = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, 1, tzinfo=timezone.utc))
-    third = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, 2, tzinfo=timezone.utc))
+    decisions = [
+        engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, i, tzinfo=timezone.utc))
+        for i in range(6)
+    ]
 
-    assert first.freeze_active is False
-    assert second.freeze_active is False
-    assert third.freeze_active is True
+    assert decisions[0].target_mbps == 8
+    assert decisions[4].freeze_active is False
+    assert decisions[5].freeze_active is True
+
+
+def test_baseline_mode_requires_higher_risk_before_freeze():
+    cfg = Config(severe_drop_score=8.0, severe_loss_windows=3, baseline_freeze_windows=6)
+    state = State(day="2026-05-13", learned_safe_mbps=8, current_mbps=8)
+    engine = PolicyEngine(cfg)
+
+    for i in range(5):
+        decision = engine.decide(state, drop_score=20.0, now=datetime(2026, 5, 13, 8, i, tzinfo=timezone.utc))
+
+    assert decision.freeze_active is False
+
+
+def test_loss_score_uses_packet_normalized_retrans_rate():
+    assert loss_score(drop_delta=0, retrans_delta=200, packet_delta=200_000) < 3
+    assert loss_score(drop_delta=100, retrans_delta=20_000, packet_delta=200_000) >= 8
 
 
 def test_stable_windows_boost_one_level_above_baseline():

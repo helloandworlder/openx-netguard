@@ -49,6 +49,7 @@ if [ ! -f "$CONFIG_DIR/config.json" ]; then
   "boost_success_required_windows": 3,
   "risk_score_backoff_threshold": 3.0,
   "risk_score_freeze_threshold": 8.0,
+  "baseline_freeze_windows": 6,
   "sample_interval_seconds": 30,
   "metric_interval_seconds": 300,
   "loss_backoff_factor": 0.7,

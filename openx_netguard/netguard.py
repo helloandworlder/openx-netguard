@@ -43,6 +43,7 @@ class Config:
     boost_success_required_windows: int = 3
     risk_score_backoff_threshold: float = 3.0
     risk_score_freeze_threshold: float = 8.0
+    baseline_freeze_windows: int = 6
     sample_interval_seconds: int = 30
     metric_interval_seconds: int = 300
     loss_backoff_factor: float = 0.7
@@ -154,10 +155,11 @@ class PolicyEngine:
         else:
             state.consecutive_loss_windows = 0
 
+        freeze_windows = self.config.baseline_freeze_windows if state.current_mbps <= self._baseline_mbps() else self.config.severe_loss_windows
         if state.tx_bytes_today >= quota_bytes:
             state.freeze_active = True
             state.freeze_reason = "daily quota reached"
-        elif state.consecutive_loss_windows >= self.config.severe_loss_windows:
+        elif state.consecutive_loss_windows >= freeze_windows:
             state.freeze_active = True
             state.freeze_reason = f"severe packet loss score {drop_score:.2f} for {state.consecutive_loss_windows} windows"
 
@@ -488,6 +490,14 @@ def read_tcp_retrans() -> int:
     return 0
 
 
+def loss_score(drop_delta: int, retrans_delta: int, packet_delta: int) -> float:
+    packets = max(1, packet_delta)
+    drop_rate = drop_delta / packets
+    retrans_rate = retrans_delta / packets
+    score = (drop_rate * 8000) + (retrans_rate * 80)
+    return round(min(20.0, score), 4)
+
+
 def apply_tc(config: Config, mbps: int, dry_run: bool = False) -> None:
     planner = TcPlanner(config)
     for cmd in planner.plan_apply(mbps):
@@ -577,7 +587,7 @@ def daemon_loop(config_path: Path, state_path: Path, once: bool = False, dry_run
         drop_delta = 0 if first_sample else max(0, drops - state.last_drop_total)
         retrans_delta = 0 if first_sample else max(0, tcp_retrans - state.last_tcp_retrans)
         packet_delta = 0 if first_sample else max(0, packets - state.last_packet_total)
-        drop_score = drop_delta + min(20, retrans_delta / 10)
+        drop_score = loss_score(drop_delta, retrans_delta, packet_delta)
 
         state.last_tx_bytes = tx
         state.last_rx_bytes = rx
